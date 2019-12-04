@@ -29,12 +29,13 @@ class JestReportPortal extends base_reporter {
         this.reportOptions = getClientInitObject(getOptions.options(options));
         this.client = new RPClient(this.reportOptions);
         this.tempSuiteIds = [];
+        this.ancestorTree = {};
+        this.openedTempSuits = [];
+        this.isCleanupNeeded = false;
         this.tempTestId = null;
+
     }
 
-    getLastTempSuidId () {
-        return this.tempSuiteIds[this.tempSuiteIds.length - 1]
-    }
 
     // eslint-disable-next-line no-unused-vars
     onRunStart (aggregatedResults, options) {
@@ -45,21 +46,119 @@ class JestReportPortal extends base_reporter {
         promiseErrorHandler(promise);
     }
 
+    // делаем структуру по типу
+    // {
+    //     arr: null,
+    //     prop: {
+    //         arr: [1,2]
+    //         prop: {
+    //             arr[3,4]
+    //         }
+    //     }
+    // }
+    createTree(ancestorTitles,ancestorTree){
+        ancestorTitles.some((ancestor, i, arr)=>{
+            if(!ancestorTree[ancestor] && arr.length !== 1) {
+                ancestorTree[ancestor] = {
+                    arr: null
+                };
+            } 
+
+            if(arr.length === 1) {
+                ancestorTree[ancestor] || (ancestorTree[ancestor] = {
+                    arr: []
+                });
+                ancestorTree[ancestor].arr.push(this.tempTest)
+                
+                return true
+            }
+            this.createTree(arr.slice(1), ancestorTree[ancestor])
+            return true
+        }) 
+    }
+
+    getLastSuiteId() {
+        return this.tempSuiteIds[this.tempSuiteIds.length-1] && this.tempSuiteIds[this.tempSuiteIds.length-1][1]
+    }
+
+     manageSuitsAndTests(tree)  {
+         //проходимся по построенному дереву
+        Object.keys(tree).forEach((suitName,i,arr) => {
+            // если в объекте кроме массива есть еще пропы
+            // скипаем иттерацию по свойству arr
+            if(suitName === 'arr' && arr.length > 1) {
+                return 
+            }
+            
+            // когда в дереве дошли до конца, нужно закрыть все суиты этой ветки
+            if(this.isCleanupNeeded) {
+                this.tempSuiteIds.some((suiteAndId, index) => {
+                    // нужно найти все суиты нужной ветки
+                    // для этого есть массив массивов tempSuiteIds
+                    // в них айдишник для апи и имя суита
+                    // если имя суита это имя ветки которую нужно закрыть - закрываем
+                    if(suiteAndId[0] === arr[i-1]) {
+                        // вырезаем из этого массива массивов все суиты которые нужно закрыть
+                        const suitesToFinish = this.tempSuiteIds.splice(index)
+
+                        suitesToFinish.forEach(suite => {
+                            this._finishSuite(suite[1])
+                        })
+                    }
+                })
+
+                this.isCleanupNeeded=false   
+            }
+            
+            const { tempId, promise } = this.client.startTestItem(
+                getSuiteStartObject(suitName),
+                this.tempLaunchId, 
+                this.getLastSuiteId()
+            )
+
+            this.tempSuiteIds.push([suitName, tempId])
+
+            promiseErrorHandler(promise);
+
+
+            if(tree[suitName].arr ) {
+                tree[suitName].arr.forEach(t => {
+                    this._startTest(t.title, tempId);
+                    this._finishTest(t);
+                });
+
+                // если проп в ветке последний и у него только массив,
+                // то закрываем суит вырезаем его и при след иттерации чистим ветку
+                if(Object.keys(tree[suitName]).length === 1) {
+                    this.isCleanupNeeded = true;
+                    this._finishSuite(tempId);
+
+                    return this.tempSuiteIds.splice(-1)
+                }
+            } 
+            
+            //рекурсией по всему дереву
+            return this.manageSuitsAndTests(tree[suitName])
+        })
+      }
+
     // eslint-disable-next-line no-unused-vars
     onTestResult (test, testResult, aggregatedResults) {
-        let suiteNames = testResult.testResults[0].ancestorTitles;
-        
-       suiteNames.forEach(name => {
-        this._startSuite(name); 
+        testResult.testResults.forEach(test => {
+            this.tempTest = test;
 
-       })
+            this.createTree(test.ancestorTitles, this.ancestorTree)
+        })
 
-        testResult.testResults.forEach(t => {
-            this._startTest(t.title);
-            this._finishTest(t);
-        });
+        this.manageSuitsAndTests(this.ancestorTree)
 
-        this._finishSuite();
+        // при завершении закрываем все суиты
+        this.tempSuiteIds.forEach(suite => {
+            this._finishSuite(suite[1])
+        })
+        // обнуляем дерево и суиты
+        this.tempSuiteIds=[]
+        this.ancestorTree={}
     }
 
     // eslint-disable-next-line no-unused-vars
@@ -71,19 +170,19 @@ class JestReportPortal extends base_reporter {
 
     _startSuite  (suiteName) {
         const { tempId, promise } = this.client.startTestItem(getSuiteStartObject(suiteName),
-            this.tempLaunchId, this.getLastTempSuidId());
+            this.tempLaunchId, this.getLastSuiteId());
             
 
         promiseErrorHandler(promise);
-        this.tempSuiteIds.push(tempId);
+        this.tempSuiteIds[suiteName]=tempId;
     }
 
-    _startTest (testName) {
+    _startTest (testName, tempSuiteId) {
         const testStartObj = getTestStartObject(testName),
 
             { tempId, promise } = this.client.startTestItem(testStartObj,
                 this.tempLaunchId,
-                this.getLastTempSuidId());
+                tempSuiteId);
 
         promiseErrorHandler(promise);
         this.tempTestId = tempId;
@@ -152,14 +251,10 @@ class JestReportPortal extends base_reporter {
         promiseErrorHandler(promise);
     }
 
-    _finishSuite () {
-        this.tempSuiteIds.forEach(item => {
-            const { promise } = this.client.finishTestItem(item, {});
+    _finishSuite (id) {
+        const { promise } = this.client.finishTestItem(id, {});
 
-            promiseErrorHandler(promise);
-        })
-
-        this.tempSuiteIds = [];
+        promiseErrorHandler(promise);
     }
 }
 
